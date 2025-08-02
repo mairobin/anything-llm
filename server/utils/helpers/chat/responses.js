@@ -39,7 +39,24 @@ function handleDefaultStreamResponseV2(response, stream, responseProps) {
     // in case things go sideways or the user does not like the response.
     // We preserve the generated text but continue as if chat was completed
     // to preserve previously generated content.
-    const handleAbort = () => {
+    const handleAbort = async () => {
+      // Complete LangSmith trace on abort
+      if (stream?.langsmithRun) {
+        try {
+          await stream.langsmithRun.end({
+            outputs: { text: fullText },
+            extra: { 
+              finish_reason: "aborted",
+              completion_tokens: usage.completion_tokens,
+              prompt_tokens: usage.prompt_tokens
+            }
+          });
+          await stream.langsmithRun.patchRun();
+        } catch (error) {
+          // LangSmith error, continue without trace completion
+        }
+      }
+      
       stream?.endMeasurement(usage);
       clientAbortedHandler(resolve, fullText);
     };
@@ -99,6 +116,24 @@ function handleDefaultStreamResponseV2(response, stream, responseProps) {
             error: false,
           });
           response.removeListener("close", handleAbort);
+          
+          // Complete LangSmith trace if present
+          if (stream?.langsmithRun) {
+            try {
+              await stream.langsmithRun.end({
+                outputs: { text: fullText },
+                extra: { 
+                  finish_reason: message.finish_reason,
+                  completion_tokens: usage.completion_tokens,
+                  prompt_tokens: usage.prompt_tokens
+                }
+              });
+              await stream.langsmithRun.patchRun();
+            } catch (error) {
+              // LangSmith error, continue without trace completion
+            }
+          }
+          
           stream?.endMeasurement(usage);
           resolve(fullText);
           break; // Break streaming when a valid finish_reason is first encountered
@@ -114,6 +149,25 @@ function handleDefaultStreamResponseV2(response, stream, responseProps) {
         close: true,
         error: e.message,
       });
+      
+      // Complete LangSmith trace on error
+      if (stream?.langsmithRun) {
+        try {
+          await stream.langsmithRun.end({
+            outputs: { text: fullText },
+            extra: { 
+              finish_reason: "error",
+              error: e.message,
+              completion_tokens: usage.completion_tokens,
+              prompt_tokens: usage.prompt_tokens
+            }
+          });
+          await stream.langsmithRun.patchRun();
+        } catch (error) {
+          // LangSmith error, continue without trace completion
+        }
+      }
+      
       stream?.endMeasurement(usage);
       resolve(fullText); // Return what we currently have - if anything.
     }

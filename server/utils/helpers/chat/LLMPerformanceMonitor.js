@@ -45,7 +45,7 @@ class LLMPerformanceMonitor {
   static measureAsyncFunction(func) {
     return (async () => {
       const start = Date.now();
-      const output = await func; // is a promise
+      const output = await func(); // call the function first
       const end = Date.now();
       return { output, duration: (end - start) / 1000 };
     })();
@@ -64,7 +64,7 @@ class LLMPerformanceMonitor {
     messages = [],
     runPromptTokenCalculation = true
   ) {
-    const stream = await func;
+    const stream = await func();
     stream.start = Date.now();
     stream.duration = 0;
     stream.metrics = {

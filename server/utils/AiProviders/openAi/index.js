@@ -8,6 +8,16 @@ const {
   LLMPerformanceMonitor,
 } = require("../../helpers/chat/LLMPerformanceMonitor");
 
+let traceable, wrapOpenAI;
+try {
+  const { traceable: traceableFunc } = require("langsmith/traceable");
+  const { wrapOpenAI: wrapOpenAIFunc } = require("langsmith/wrappers");
+  traceable = traceableFunc;
+  wrapOpenAI = wrapOpenAIFunc;
+} catch (error) {
+  // LangSmith not available, continue without tracing
+}
+
 class OpenAiLLM {
   constructor(embedder = null, modelPreference = null) {
     if (!process.env.OPEN_AI_KEY) throw new Error("No OpenAI API key was set.");
@@ -16,6 +26,12 @@ class OpenAiLLM {
     this.openai = new OpenAIApi({
       apiKey: process.env.OPEN_AI_KEY,
     });
+
+    // Client-level wrapping disabled to prevent duplicate traces
+    // We use manual RunTree tracing instead for better control
+    // if (wrapOpenAI && process.env.LANGSMITH_TRACING === "true") {
+    //   this.openai = wrapOpenAI(this.openai);
+    // }
     this.model = modelPreference || process.env.OPEN_MODEL_PREF || "gpt-4o";
     this.limits = {
       history: this.promptWindowLimit() * 0.15,
@@ -144,8 +160,8 @@ class OpenAiLLM {
         `OpenAI chat: ${this.model} is not valid for chat completion!`
       );
 
-    const result = await LLMPerformanceMonitor.measureAsyncFunction(
-      this.openai.chat.completions
+    const chatCompletionFunction = async () => {
+      return await this.openai.chat.completions
         .create({
           model: this.model,
           messages,
@@ -153,8 +169,18 @@ class OpenAiLLM {
         })
         .catch((e) => {
           throw new Error(e.message);
+        });
+    };
+
+    // Wrap with LangSmith tracing if available
+    const tracedFunction = traceable && process.env.LANGSMITH_TRACING === "true" 
+      ? traceable(chatCompletionFunction, {
+          name: "openai_chat_completion",
+          metadata: { model: this.model, temperature: this.isOTypeModel ? 1 : temperature }
         })
-    );
+      : chatCompletionFunction;
+
+    const result = await LLMPerformanceMonitor.measureAsyncFunction(tracedFunction);
 
     if (
       !result.output.hasOwnProperty("choices") ||
@@ -180,18 +206,49 @@ class OpenAiLLM {
         `OpenAI chat: ${this.model} is not valid for chat completion!`
       );
 
-    const measuredStreamRequest = await LLMPerformanceMonitor.measureStream(
-      this.openai.chat.completions.create({
+    const streamCompletionFunction = async () => {
+      return this.openai.chat.completions.create({
         model: this.model,
         stream: true,
         messages,
         temperature: this.isOTypeModel ? 1 : temperature, // o1 models only accept temperature 1
-      }),
+      });
+    };
+
+    // For streaming, we create a manual LangSmith trace to avoid cancellation issues
+    let langsmithRun = null;
+    if (traceable && process.env.LANGSMITH_TRACING === "true") {
+      try {
+        const { RunTree } = require("langsmith");
+        langsmithRun = new RunTree({
+          name: "openai_stream_completion",
+          inputs: { 
+            messages, 
+            model: this.model, 
+            temperature: this.isOTypeModel ? 1 : temperature,
+            stream: true 
+          },
+          project_name: process.env.LANGSMITH_PROJECT,
+        });
+        await langsmithRun.postRun();
+      } catch (error) {
+        // LangSmith error, continue without tracing
+        langsmithRun = null;
+      }
+    }
+
+    const measuredStreamRequest = await LLMPerformanceMonitor.measureStream(
+      streamCompletionFunction,
       messages
       // runPromptTokenCalculation: true - We manually count the tokens because OpenAI does not provide them in the stream
       // since we are not using the OpenAI API version that supports this `stream_options` param.
       // TODO: implement this once we upgrade to the OpenAI API version that supports this param.
     );
+
+    // Add langsmith run to stream for completion tracking
+    if (langsmithRun) {
+      measuredStreamRequest.langsmithRun = langsmithRun;
+    }
 
     return measuredStreamRequest;
   }
